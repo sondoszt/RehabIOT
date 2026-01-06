@@ -886,17 +886,34 @@ void loop() {
   }
 
 // ---------- DONE ----------
+// ---------- DONE ----------
 if (state == DONE) {
   int sx2, sy2;
+
+  // ✅ Any touch anywhere => back to level select
   if (touchDebounced(sx2, sy2, nullptr)) {
-    // ✅ tap anywhere => back to level select
+
+    // reset debounce so next screen immediately responds
+    lastTouchMs = millis();
+
+    // clear game state
+    ledsOff();
+    phase = PHASE_IDLE;
+    roundNum = 0;
+    score = 0;
+    coinsEarned = 0;
+    prevLed = 255;
+
+    // go back to choose-level screen
     level = NONE;
     state = PICK_LEVEL;
     drawLevelScreen();
   }
+
   delay(20);
   return;
 }
+
 
 
 
