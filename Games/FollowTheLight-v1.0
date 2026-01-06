@@ -1,0 +1,904 @@
+/*
+  Follow The Light – Memory Game (ESP32 + ILI9341 + XPT2046 + PN532 + NeoPixel)
+  ✅ FIXES:
+  - LEVEL PICK is reliable (RAW split + fallback)
+  - Center area clears by REDRAWING background (no black band)
+  - Progress bar ABOVE card (shorter)
+  - Timeouts: WARM-UP = 8s, HOT MODE = 5s (with countdown bar)
+  - Round/Score box aligned right
+  - RFID recovery + periodic SAM rearm
+
+  ✅ UI Upgrade #1:
+  - WATCH: gentle pulse glow around center card
+  - SCAN : breathing glow around center card (while scanning)
+
+  ✅ Coins + Feedback (local only):
+  - End screen shows: Score + Coins + Feedback
+
+  ✅ End Screen layout updates (your requests):
+  - Remove "Follow the Light" title on end screen (only "Session finished")
+  - Score not huge
+  - Feedback ABOVE Play Again
+  - Fonts colored (cyan/gold/white)
+  - NO "Tap anywhere to restart" line
+  - Tapping PLAY AGAIN restarts immediately (same selected level)
+  - Coin celebration LEDs once per end screen
+*/
+
+#include <SPI.h>
+#include <Wire.h>
+#include <TFT_eSPI.h>
+#include <XPT2046_Touchscreen.h>
+#include <Adafruit_PN532.h>
+#include <Adafruit_NeoPixel.h>
+#include <math.h>
+
+// ---------------- PINS ----------------
+#define TFT_CS_PIN   15
+
+#define TOUCH_CS     5
+#define TOUCH_IRQ    27
+
+#define PN532_SDA    32
+#define PN532_SCL    33
+
+#define LED_PIN      25
+#define LED_COUNT    32
+
+// Your wiring:
+#define SPI_SCK_PIN  18
+#define SPI_MISO_PIN 19
+#define SPI_MOSI_PIN 23
+
+// ---------------- OBJECTS ----------------
+TFT_eSPI tft = TFT_eSPI();
+XPT2046_Touchscreen ts(TOUCH_CS, TOUCH_IRQ);
+Adafruit_PN532 nfc(-1, -1);
+Adafruit_NeoPixel strip(LED_COUNT, LED_PIN, NEO_GRB + NEO_KHZ800);
+
+// ---------------- SCREEN ----------------
+static const int SCREEN_W = 320;
+static const int SCREEN_H = 240;
+static const uint8_t TFT_ROT = 1;
+static const uint8_t TS_ROT  = 1;
+
+// ---------------- TOUCH FILTER ----------------
+static const int Z_MIN = 200;
+static const int Z_MAX = 3800;
+static uint32_t lastTouchMs = 0;
+
+// Calibration (yours)
+static int  TOUCH_X_MIN = 350;
+static int  TOUCH_X_MAX = 3800;
+static int  TOUCH_Y_MIN = 300;
+static int  TOUCH_Y_MAX = 3800;
+
+static bool TOUCH_SWAP_XY  = true;
+static bool TOUCH_INVERT_X = true;
+static bool TOUCH_INVERT_Y = false;
+static const int RAW_SPLIT_Y = 2600;
+
+// ---------------- LEVEL SETTINGS ----------------
+static const int ROUNDS_L1 = 10;
+static const int ROUNDS_L2 = 12;
+
+// remember LED on-time
+static const uint32_t LED_ON_L1_MS = 1000;
+static const uint32_t LED_ON_L2_MS = 200;
+
+// scan timeouts
+static const uint32_t SCAN_TIMEOUT_L1_MS = 8000; // 8 sec
+static const uint32_t SCAN_TIMEOUT_L2_MS = 5000; // 5 sec
+
+// ---------------- LED ZONES ----------------
+const uint8_t LED_ZONES[] = {0,2,4,6,9,11,13,15,16,18,20,22,25,27,29,31};
+const int NUM_ZONES = sizeof(LED_ZONES) / sizeof(LED_ZONES[0]);
+
+// ---------------- UID MAP ----------------
+struct ZoneMap { uint8_t led; uint8_t uid[4]; };
+ZoneMap MAP[] = {
+  {0,{0x49,0x04,0x16,0xA4}}, {2,{0xC4,0x90,0x86,0xBB}},
+  {4,{0x39,0x94,0xBB,0xA2}}, {6,{0x46,0xC2,0x86,0xBB}},
+  {9,{0x79,0x78,0x21,0xA4}}, {11,{0x49,0xB3,0x25,0xA4}},
+  {13,{0x79,0x69,0xCC,0xA2}}, {15,{0xB9,0xB7,0x84,0xC1}},
+  {16,{0x89,0x74,0x85,0xC2}}, {18,{0x6B,0x8F,0xD5,0xAB}},
+  {20,{0x89,0x59,0x23,0xA4}}, {22,{0x29,0xCF,0x38,0x59}},
+  {25,{0xD9,0x60,0x22,0xA4}}, {27,{0x89,0xE9,0xC3,0xA2}},
+  {29,{0x19,0xF7,0x80,0xC1}}, {31,{0x09,0xC3,0xCA,0xA2}}
+};
+const int MAP_LEN = sizeof(MAP) / sizeof(MAP[0]);
+
+// ---------------- GAME STATE ----------------
+enum Level { NONE, LEVEL_1, LEVEL_2 };
+enum State { PICK_LEVEL, PLAYING, DONE };
+enum RoundPhase { PHASE_IDLE, PHASE_REMEMBER, PHASE_SCAN };
+
+Level level = NONE;
+State state = PICK_LEVEL;
+RoundPhase phase = PHASE_IDLE;
+
+int roundsTotal = ROUNDS_L1;
+uint32_t ledOnMs = LED_ON_L1_MS;
+
+int roundNum = 0;
+int score = 0;
+int coinsEarned = 0;
+
+uint8_t currentLed = 0;
+uint8_t prevLed = 255;
+uint32_t scanStartMs = 0;
+
+// RFID recovery
+unsigned long lastRFIDSeenOkMs = 0;
+const unsigned long RFID_RECOVER_MS = 6000;
+uint32_t lastSAMRearmMs = 0;
+
+// Countdown throttle
+static uint32_t lastCountdownDrawMs = 0;
+
+// ---------- UI COLORS ----------
+const uint16_t C_BG     = 0x08A3;
+const uint16_t C_PANEL  = 0x10C5;
+const uint16_t C_PANEL2 = 0x18E7;
+const uint16_t C_TEXT   = TFT_WHITE;
+const uint16_t C_MUTED  = 0xBDF7;
+const uint16_t C_ACCENT = 0x07FF;  // cyan
+const uint16_t C_OK     = 0x07E0;  // green
+const uint16_t C_BAD    = 0xF800;  // red
+const uint16_t C_WARN   = 0xFD20;  // gold
+const uint16_t C_SCAN   = 0x07FF;  // cyan
+
+// ✅ PHASE ANIMATION STATE
+static uint32_t lastScanGlowMs = 0;
+static uint32_t lastWatchGlowMs = 0;
+static uint8_t scanPulseT = 0;
+static int8_t  scanPulseDir = 6;
+static uint8_t watchPulseT = 0;
+static int8_t  watchPulseDir = 8;
+
+// ✅ end screen one-time celebration
+static bool endCelebrated = false;
+
+// ---------------- LED HELPERS ----------------
+void lightOnly(uint8_t idx) {
+  strip.clear();
+  strip.setPixelColor(idx, strip.Color(255,255,255));
+  strip.show();
+}
+void ledsOff() { strip.clear(); strip.show(); }
+
+void flashAll(uint32_t color, int times, int onMs=120, int offMs=80) {
+  for(int t=0;t<times;t++){
+    for(int i=0;i<LED_COUNT;i++) strip.setPixelColor(i,color);
+    strip.show(); delay(onMs);
+    strip.clear(); strip.show(); delay(offMs);
+  }
+}
+
+void quickAck(bool ok) {
+  uint32_t c = ok ? strip.Color(0, 180, 0) : strip.Color(180, 0, 0);
+  strip.clear();
+  strip.setPixelColor(currentLed, c);
+  strip.show();
+  delay(40);
+  strip.clear();
+  strip.show();
+}
+
+// ✅ coin celebration synced with earned coins (short + nice)
+void celebrateCoinsOnce(int coins) {
+  // cap so it doesn't take forever
+  int bursts = coins;
+  if (bursts < 2) bursts = 2;
+  if (bursts > 8) bursts = 8;
+
+  for (int b = 0; b < bursts; b++) {
+    strip.clear();
+    // sprinkle gold sparkles
+    for (int k = 0; k < 6; k++) {
+      int i = random(0, LED_COUNT);
+      strip.setPixelColor(i, strip.Color(220, 160, 0));
+    }
+    strip.show();
+    delay(70);
+
+    strip.clear();
+    strip.show();
+    delay(40);
+  }
+
+  // final soft pulse
+  for (int p = 0; p < 2; p++) {
+    for (int i=0;i<LED_COUNT;i++) strip.setPixelColor(i, strip.Color(0, 120, 180));
+    strip.show(); delay(70);
+    strip.clear(); strip.show(); delay(60);
+  }
+}
+
+// ---------------- TOUCH ----------------
+static int clampi(int v, int lo, int hi){
+  if(v < lo) return lo;
+  if(v > hi) return hi;
+  return v;
+}
+
+bool readTouchRaw(TS_Point &out) {
+  digitalWrite(TFT_CS_PIN, HIGH);
+  if (TOUCH_IRQ != 255 && digitalRead(TOUCH_IRQ) == HIGH) return false;
+
+  TS_Point best(0,0,0);
+  for(int i=0;i<6;i++){
+    TS_Point p = ts.getPoint();
+    if(p.z > best.z) best = p;
+    delay(2);
+  }
+
+  if(best.z < Z_MIN || best.z > Z_MAX) return false;
+  out = best;
+  return true;
+}
+
+bool rawToScreen(const TS_Point &raw, int &sx, int &sy) {
+  int rx = raw.x;
+  int ry = raw.y;
+
+  if(TOUCH_SWAP_XY) { int tmp = rx; rx = ry; ry = tmp; }
+
+  rx = clampi(rx, TOUCH_X_MIN, TOUCH_X_MAX);
+  ry = clampi(ry, TOUCH_Y_MIN, TOUCH_Y_MAX);
+
+  long nx = (long)(rx - TOUCH_X_MIN) * (SCREEN_W - 1) / (TOUCH_X_MAX - TOUCH_X_MIN);
+  long ny = (long)(ry - TOUCH_Y_MIN) * (SCREEN_H - 1) / (TOUCH_Y_MAX - TOUCH_Y_MIN);
+
+  if(TOUCH_INVERT_X) nx = (SCREEN_W - 1) - nx;
+  if(TOUCH_INVERT_Y) ny = (SCREEN_H - 1) - ny;
+
+  sx = (int)nx;
+  sy = (int)ny;
+  return true;
+}
+
+bool touchDebounced(int &sx, int &sy, TS_Point *rawOut=nullptr) {
+  TS_Point raw;
+  if(!readTouchRaw(raw)) return false;
+  if(millis() - lastTouchMs < 220) return false;
+  lastTouchMs = millis();
+  if(rawOut) *rawOut = raw;
+  return rawToScreen(raw, sx, sy);
+}
+
+// ---------------- RFID ----------------
+bool readUID4(uint8_t out[4]) {
+  uint8_t uid[7], len;
+  if(!nfc.readPassiveTargetID(PN532_MIFARE_ISO14443A, uid, &len, 50)) return false;
+  if(len < 4) return false;
+  for(int i=0;i<4;i++) out[i]=uid[i];
+  return true;
+}
+const uint8_t* expectedUID(uint8_t led){
+  for(int i=0;i<MAP_LEN;i++) if(MAP[i].led == led) return MAP[i].uid;
+  return nullptr;
+}
+bool uidEq(const uint8_t*a,const uint8_t*b){
+  for(int i=0;i<4;i++) if(a[i]!=b[i]) return false;
+  return true;
+}
+
+bool initPN532() {
+  nfc.begin();
+  delay(30);
+  uint32_t v = nfc.getFirmwareVersion();
+  if(!v) return false;
+  nfc.SAMConfig();
+  return true;
+}
+
+bool initPN532WithFallback() {
+  Wire.setClock(400000);
+  if(initPN532()) return true;
+  Wire.setClock(100000);
+  delay(30);
+  return initPN532();
+}
+
+// ---------------- UI (PRETTY) ----------------
+uint16_t blend565(uint16_t c1, uint16_t c2, uint8_t t) {
+  uint8_t r1 = (c1 >> 11) & 0x1F;
+  uint8_t g1 = (c1 >> 5)  & 0x3F;
+  uint8_t b1 = (c1)       & 0x1F;
+
+  uint8_t r2 = (c2 >> 11) & 0x1F;
+  uint8_t g2 = (c2 >> 5)  & 0x3F;
+  uint8_t b2 = (c2)       & 0x1F;
+
+  uint8_t r = (r1 * (255 - t) + r2 * t) / 255;
+  uint8_t g = (g1 * (255 - t) + g2 * t) / 255;
+  uint8_t b = (b1 * (255 - t) + b2 * t) / 255;
+
+  return (r << 11) | (g << 5) | b;
+}
+
+void fillGradV(int x, int y, int w, int h, uint16_t top, uint16_t bot, int step=2) {
+  for (int i = 0; i < h; i += step) {
+    uint8_t t = (uint32_t)i * 255 / (h - 1);
+    uint16_t c = blend565(top, bot, t);
+    tft.fillRect(x, y + i, w, step, c);
+  }
+}
+
+void drawBackground() {
+  uint16_t top = C_BG;
+  uint16_t bot = 0x0008;
+  fillGradV(0, 0, SCREEN_W, SCREEN_H, top, bot, 2);
+
+  for (int i = 0; i < 28; i++) {
+    int px = random(0, SCREEN_W);
+    int py = random(0, SCREEN_H);
+    tft.drawPixel(px, py, TFT_WHITE);
+  }
+}
+
+void uiClear() { drawBackground(); }
+
+// used for gameplay screens
+void uiTopBar(const char* subtitle) {
+  int x = 10, y = 10, w = 300, h = 58;
+  uint16_t top = 0x0211;
+  uint16_t bot = C_PANEL;
+
+  tft.fillRoundRect(x, y, w, h, 16, bot);
+  fillGradV(x+2, y+2, w-4, h-4, top, bot, 2);
+
+  tft.drawRoundRect(x, y, w, h, 16, 0x7BEF);
+  tft.drawFastHLine(x+16, y+h-2, w-32, C_ACCENT);
+
+  tft.setTextDatum(MC_DATUM);
+  tft.setTextFont(4);
+
+  tft.setTextColor(TFT_BLACK, bot);
+  tft.drawString("Follow the Light", 161, 30);
+
+  tft.setTextColor(C_ACCENT, bot);
+  tft.drawString("Follow the Light", 160, 29);
+
+  tft.setTextFont(2);
+  tft.setTextColor(TFT_WHITE, bot);
+  tft.drawString(subtitle, 160, 55);
+
+  tft.setTextDatum(TL_DATUM);
+}
+
+// ✅ minimal end header (no title bar)
+void uiEndHeaderMinimal() {
+  // clear a soft strip behind header
+  fillGradV(0, 0, SCREEN_W, 46, C_BG, 0x0008, 2);
+
+  tft.setTextDatum(MC_DATUM);
+  tft.setTextFont(2);
+  tft.setTextColor(C_MUTED, TFT_BLACK);
+  tft.drawString("Session finished", 160, 22);
+  tft.setTextDatum(TL_DATUM);
+}
+
+void uiStatusRight(int r, int total, int s) {
+  int w = 86, h = 46;
+  int x = SCREEN_W - w - 8;
+  int y = 70;
+
+  tft.fillRoundRect(x, y, w, h, 12, C_PANEL2);
+  tft.setTextFont(2);
+  tft.setTextColor(TFT_WHITE, C_PANEL2);
+
+  tft.setCursor(x + 8, y + 8);
+  tft.printf("R %d/%d", r, total);
+
+  tft.setCursor(x + 8, y + 26);
+  tft.printf("S %d", s);
+}
+
+void uiProgress(int currentRound, int totalRounds) {
+  int x = 10, y = 74, w = 210, h = 10;
+  tft.fillRoundRect(x, y, w, h, 6, C_PANEL2);
+
+  float frac = 0.0f;
+  if(totalRounds > 0) frac = (float)(currentRound-1) / (float)totalRounds;
+  if(frac < 0) frac = 0;
+  if(frac > 1) frac = 1;
+
+  int fillW = (int)(w * frac);
+  tft.fillRoundRect(x, y, fillW, h, 6, C_ACCENT);
+}
+
+void uiCenterCard(const char* msg, uint16_t bgColor) {
+  int x = 20, y = 122, w = 280, h = 70;
+
+  tft.fillRoundRect(x+3, y+3, w, h, 16, TFT_BLACK);
+  tft.fillRoundRect(x, y, w, h, 16, bgColor);
+  tft.drawRoundRect(x, y, w, h, 16, TFT_WHITE);
+
+  tft.setTextDatum(MC_DATUM);
+  tft.setTextFont(4);
+
+  // colored fonts
+  uint16_t txt = TFT_WHITE;
+  if (bgColor == C_WARN) txt = TFT_BLACK;
+  if (bgColor == C_OK)   txt = TFT_BLACK;
+
+  tft.setTextColor(txt, bgColor);
+  tft.drawString(msg, 160, y + h/2 + 4);
+  tft.setTextDatum(TL_DATUM);
+}
+
+void uiHint(const char* msg) {
+  fillGradV(0, 214, SCREEN_W, 26, C_BG, 0x0008, 2);
+  tft.setTextFont(2);
+  tft.setTextColor(C_MUTED, 0x0000);
+  tft.setTextDatum(MC_DATUM);
+  tft.drawString(msg, 160, 230);
+  tft.setTextDatum(TL_DATUM);
+}
+
+void uiButton(int x, int y, int w, int h, uint16_t bg, const char* label) {
+  tft.fillRoundRect(x+3, y+3, w, h, 18, TFT_BLACK);
+  tft.fillRoundRect(x, y, w, h, 18, bg);
+  tft.drawRoundRect(x, y, w, h, 18, TFT_WHITE);
+
+  tft.setTextDatum(MC_DATUM);
+  tft.setTextFont(4);
+
+  // darker shadow
+  tft.setTextColor(TFT_BLACK, bg);
+  tft.drawString(label, x + w/2 + 1, y + h/2 + 1);
+
+  // main
+  tft.setTextColor(TFT_WHITE, bg);
+  tft.drawString(label, x + w/2, y + h/2);
+
+  tft.setTextDatum(TL_DATUM);
+}
+
+void uiScanCountdown(uint32_t elapsedMs, uint32_t totalMs) {
+  int x = 30, y = 200, w = 260, h = 12;
+
+  tft.fillRoundRect(x, y, w, h, 6, C_PANEL2);
+
+  float frac = (totalMs > 0) ? (float)elapsedMs / totalMs : 0;
+  if (frac < 0) frac = 0;
+  if (frac > 1) frac = 1;
+
+  int fillW = (int)(w * (1.0f - frac));
+  if (fillW < 0) fillW = 0;
+
+  tft.fillRoundRect(x, y, fillW, h, 6, C_WARN);
+}
+
+void clearCenterArea() {
+  fillGradV(0, 118, SCREEN_W, 92, C_BG, 0x0008, 2);
+  for(int i=0;i<6;i++){
+    int px = random(0, SCREEN_W);
+    int py = random(118, 118+92);
+    tft.drawPixel(px, py, TFT_WHITE);
+  }
+}
+
+// --- Phase glow borders ---
+void uiCardGlowBorder(uint16_t glowColor, int thickness = 2) {
+  int x = 20, y = 122, w = 280, h = 70;
+  for(int i=0;i<thickness;i++){
+    tft.drawRoundRect(x - i, y - i, w + 2*i, h + 2*i, 16, glowColor);
+  }
+}
+
+void uiScanBreathingGlowTick() {
+  if (millis() - lastScanGlowMs < 60) return;
+  lastScanGlowMs = millis();
+
+  scanPulseT = (uint8_t)((int)scanPulseT + scanPulseDir);
+  if (scanPulseT > 230 || scanPulseT < 30) scanPulseDir = -scanPulseDir;
+
+  uint16_t glow = blend565(C_ACCENT, TFT_WHITE, scanPulseT);
+  uiCardGlowBorder(glow, 2);
+}
+
+void uiWatchPulseTick() {
+  if (millis() - lastWatchGlowMs < 70) return;
+  lastWatchGlowMs = millis();
+
+  watchPulseT = (uint8_t)((int)watchPulseT + watchPulseDir);
+  if (watchPulseT > 220 || watchPulseT < 40) watchPulseDir = -watchPulseDir;
+
+  uint16_t glow = blend565(C_WARN, TFT_WHITE, watchPulseT);
+  uiCardGlowBorder(glow, 1);
+}
+
+// ---------------- COINS + FEEDBACK ----------------
+int calcCoinsEarned(int scoreVal, Level lvl) {
+  float mult = (lvl == LEVEL_2) ? 1.3f : 1.0f;
+  int coins = (int)round(scoreVal * mult);
+  if (coins < 0) coins = 0;
+  return coins;
+}
+
+const char* feedbackText(int scoreVal, int totalRounds, Level lvl) {
+  if (totalRounds <= 0) return "Good session!";
+  float p = (float)scoreVal / (float)totalRounds;
+
+  if (p >= 0.90f) return (lvl == LEVEL_2) ? "Elite reflexes! 🔥" : "Amazing focus! 🌟";
+  if (p >= 0.70f) return "Great job! Keep going 💪";
+  if (p >= 0.45f) return "Nice effort! You’re improving 🙂";
+  return "Warm-up more — you got this 🙌";
+}
+
+// ---------------- SCREENS ----------------
+static const int BTN_X = 20;
+static const int BTN_W = 280;
+static const int BTN_H = 52;
+static const int BTN_WARM_Y = 98;
+static const int BTN_HOT_Y  = 158;
+
+// End screen button hit area
+static const int END_BTN_X = 60;
+static const int END_BTN_Y = 198;
+static const int END_BTN_W = 200;
+static const int END_BTN_H = 34;
+
+void drawLevelScreen() {
+  uiClear();
+  uiTopBar("Choose a mode");
+  uiHint("Tap a mode to start");
+
+  uiButton(BTN_X, BTN_WARM_Y, BTN_W, BTN_H, C_OK,   "WARM-UP");
+  uiButton(BTN_X, BTN_HOT_Y,  BTN_W, BTN_H, C_WARN, "HOT MODE");
+}
+
+void drawEndScreen() {
+  ledsOff();
+  uiClear();
+
+  // ✅ minimal header only
+  uiEndHeaderMinimal();
+
+  // compute coins + feedback locally
+  coinsEarned = calcCoinsEarned(score, level);
+  const char* fb = feedbackText(score, roundsTotal, level);
+
+  // ✅ celebrate coins once
+  if (!endCelebrated) {
+    celebrateCoinsOnce(coinsEarned);
+    endCelebrated = true;
+  }
+
+  // ---------- SCORE CARD (not huge, more breathing room) ----------
+  int cardX = 24, cardY = 52, cardW = 272, cardH = 78;
+
+  tft.fillRoundRect(cardX+3, cardY+3, cardW, cardH, 16, TFT_BLACK);
+  tft.fillRoundRect(cardX,   cardY,   cardW, cardH, 16, C_PANEL2);
+  tft.drawRoundRect(cardX,   cardY,   cardW, cardH, 16, TFT_WHITE);
+
+  tft.setTextDatum(MC_DATUM);
+
+  // label (cyan)
+  tft.setTextFont(4);
+  tft.setTextColor(C_ACCENT, C_PANEL2);
+  tft.drawString("FINAL SCORE", 160, cardY + 18);
+
+  // score (smaller)
+  tft.setTextFont(6);
+  tft.setTextColor(TFT_WHITE, C_PANEL2);
+  tft.drawString(String(score), 160, cardY + 52);
+
+  // ---------- COINS PILL (gold/cyan text) ----------
+  int pillX = 74, pillY = cardY + cardH + 10, pillW = 172, pillH = 24;
+
+  tft.fillRoundRect(pillX, pillY, pillW, pillH, 12, 0x0841);
+  tft.drawRoundRect(pillX, pillY, pillW, pillH, 12, TFT_WHITE);
+
+  // coin icon
+  int coinCx = pillX + 18;
+  int coinCy = pillY + pillH/2;
+  tft.fillCircle(coinCx, coinCy, 6, C_WARN);
+  tft.drawCircle(coinCx, coinCy, 6, TFT_WHITE);
+
+  // coins text
+  tft.setTextFont(2);
+  tft.setTextColor(C_ACCENT, 0x0841);
+  tft.drawString("+", pillX + 40, coinCy);
+  tft.setTextColor(TFT_WHITE, 0x0841);
+  tft.drawString(String(coinsEarned), pillX + 55, coinCy);
+  tft.setTextColor(C_ACCENT, 0x0841);
+  tft.drawString("COINS", pillX + 100, coinCy);
+
+  // ---------- FEEDBACK (ABOVE button) ----------
+  int fbX = 18, fbY = pillY + pillH + 10, fbW = 284, fbH = 28;
+  tft.fillRoundRect(fbX, fbY, fbW, fbH, 12, C_PANEL);
+  tft.drawRoundRect(fbX, fbY, fbW, fbH, 12, TFT_WHITE);
+
+  tft.setTextDatum(MC_DATUM);
+  tft.setTextFont(2);
+  tft.setTextColor(TFT_WHITE, C_PANEL);
+  tft.drawString(fb, 160, fbY + fbH/2);
+
+  // ---------- PLAY AGAIN (bottom, single action) ----------
+  uiButton(END_BTN_X, END_BTN_Y, END_BTN_W, END_BTN_H, C_ACCENT, "PLAY AGAIN");
+
+  tft.setTextDatum(TL_DATUM);
+}
+
+// ---------------- GAME FLOW ----------------
+void applyLevel() {
+  if(level == LEVEL_1) { roundsTotal = ROUNDS_L1; ledOnMs = LED_ON_L1_MS; }
+  else                 { roundsTotal = ROUNDS_L2; ledOnMs = LED_ON_L2_MS; }
+}
+
+uint8_t pickNextLed() {
+  uint8_t led;
+  do { led = LED_ZONES[random(NUM_ZONES)]; }
+  while(led == prevLed && NUM_ZONES > 1);
+  prevLed = led;
+  return led;
+}
+
+void beginRound() {
+  applyLevel();
+
+  roundNum++;
+  if(roundNum > roundsTotal) {
+    state = DONE;
+    drawEndScreen();
+    return;
+  }
+
+  currentLed = pickNextLed();
+
+  uiClear();
+  uiTopBar((level==LEVEL_1) ? "WARM-UP MODE" : "HOT MODE");
+  uiStatusRight(roundNum, roundsTotal, score);
+  uiProgress(roundNum, roundsTotal);
+
+  clearCenterArea();
+
+  // ---------- WATCH ----------
+  phase = PHASE_REMEMBER;
+  uiCenterCard("WATCH", C_WARN);
+  uiHint("Remember the peg position");
+
+  lastWatchGlowMs = 0;
+  watchPulseT = 0;
+  watchPulseDir = 8;
+
+  lightOnly(currentLed);
+  uint32_t watchStart = millis();
+  while (millis() - watchStart < ledOnMs) {
+    uiWatchPulseTick();
+    delay(5);
+  }
+  ledsOff();
+
+  clearCenterArea();
+
+  // ---------- SCAN ----------
+  phase = PHASE_SCAN;
+  clearCenterArea();
+  uiCenterCard("SCAN", C_ACCENT);
+  uiHint("Scan the matching RFID peg");
+
+  lastScanGlowMs = 0;
+  scanPulseT = 0;
+  scanPulseDir = 6;
+  uiCardGlowBorder(TFT_WHITE, 2);
+
+  scanStartMs = millis();
+  lastCountdownDrawMs = 0;
+}
+
+void showResult(bool correct, bool timeout=false) {
+  if(timeout) {
+    uiCenterCard("TIME UP", C_BAD);
+    flashAll(strip.Color(180,0,0), 1, 200, 120);
+    delay(260);
+    return;
+  }
+  if(correct) {
+    uiCenterCard("NICE!", C_OK);
+    flashAll(strip.Color(0,180,0), 2);
+  } else {
+    uiCenterCard("ALMOST!", C_BAD);
+    flashAll(strip.Color(180,0,0), 1, 200, 120);
+  }
+  delay(260);
+}
+
+void startGameWithCountdown() {
+  applyLevel();
+
+  roundNum = 0;
+  score = 0;
+  coinsEarned = 0;
+  phase = PHASE_IDLE;
+  prevLed = 255;
+  endCelebrated = false;
+
+  uiClear();
+  uiTopBar((level==LEVEL_1) ? "WARM-UP MODE" : "HOT MODE");
+  uiHint("Starting...");
+
+  for(int n=3; n>=1; n--){
+    clearCenterArea();
+    tft.fillRoundRect(60, 102, 200, 78, 18, C_PANEL2);
+    tft.drawRoundRect(60, 102, 200, 78, 18, TFT_WHITE);
+
+    tft.setTextDatum(MC_DATUM);
+    tft.setTextFont(8);
+
+    tft.setTextColor(TFT_BLACK, C_PANEL2);
+    tft.drawString(String(n), 162, 142);
+
+    tft.setTextColor(TFT_WHITE, C_PANEL2);
+    tft.drawString(String(n), 160, 140);
+
+    tft.setTextDatum(TL_DATUM);
+
+    flashAll(strip.Color(0,120,180), 1, 60, 60);
+    delay(650);
+  }
+
+  clearCenterArea();
+  uiCenterCard("GO!", C_OK);
+  flashAll(strip.Color(0,180,0), 2, 70, 60);
+  delay(220);
+
+  state = PLAYING;
+  beginRound();
+}
+
+// ---------------- SETUP ----------------
+void setup() {
+  Serial.begin(115200);
+  delay(150);
+  randomSeed(micros());
+
+  pinMode(TFT_CS_PIN, OUTPUT);
+  digitalWrite(TFT_CS_PIN, HIGH);
+
+  pinMode(TOUCH_CS, OUTPUT);
+  digitalWrite(TOUCH_CS, HIGH);
+
+  pinMode(TOUCH_IRQ, INPUT);
+
+  SPI.begin(SPI_SCK_PIN, SPI_MISO_PIN, SPI_MOSI_PIN);
+
+  tft.init();
+  tft.setRotation(TFT_ROT);
+  tft.setTextWrap(false);
+
+  ts.begin();
+  ts.setRotation(TS_ROT);
+
+  strip.begin();
+  ledsOff();
+
+  Wire.begin(PN532_SDA, PN532_SCL);
+
+  if(!initPN532WithFallback()) {
+    uiClear();
+    uiTopBar("Hardware Error");
+    uiCenterCard("CHECK RFID", C_BAD);
+    while(1) delay(1000);
+  }
+
+  lastRFIDSeenOkMs = millis();
+  lastSAMRearmMs = millis();
+
+  drawLevelScreen();
+}
+
+// ---------------- LOOP ----------------
+void loop() {
+  int sx, sy;
+  TS_Point raw;
+
+  // ---------- PICK LEVEL ----------
+  if (state == PICK_LEVEL) {
+    if (touchDebounced(sx, sy, &raw)) {
+      const int DEAD = 80;
+      int rawY = raw.y;
+
+      if (rawY <= RAW_SPLIT_Y - DEAD) level = LEVEL_1;
+      else if (rawY >= RAW_SPLIT_Y + DEAD) level = LEVEL_2;
+      else {
+        int warmBottom = BTN_WARM_Y + BTN_H; // 150
+        int hotTop     = BTN_HOT_Y;         // 158
+        int midLine    = (warmBottom + hotTop) / 2; // 154
+        level = (sy >= midLine) ? LEVEL_2 : LEVEL_1;
+      }
+
+      applyLevel();
+      startGameWithCountdown();
+    }
+    delay(10);
+    return;
+  }
+
+  // ---------- PLAYING ----------
+  if(state == PLAYING) {
+
+    if (phase == PHASE_SCAN) {
+      uiScanBreathingGlowTick();
+    }
+
+    // RFID FIRST
+    if(phase == PHASE_SCAN) {
+      uint8_t uid4[4];
+      if(readUID4(uid4)) {
+        lastRFIDSeenOkMs = millis();
+
+        const uint8_t* exp = expectedUID(currentLed);
+        bool correct = (exp && uidEq(uid4, exp));
+        if(correct) score++;
+
+        quickAck(correct);
+        uiStatusRight(roundNum, roundsTotal, score);
+        showResult(correct, false);
+
+        nfc.SAMConfig();
+        lastSAMRearmMs = millis();
+
+        beginRound();
+        return;
+      }
+    }
+
+    // TIMEOUT + countdown
+    if(phase == PHASE_SCAN) {
+      uint32_t elapsed = millis() - scanStartMs;
+      uint32_t timeoutMs = (level == LEVEL_2) ? SCAN_TIMEOUT_L2_MS : SCAN_TIMEOUT_L1_MS;
+
+      if(lastCountdownDrawMs == 0 || millis() - lastCountdownDrawMs > 80) {
+        uiScanCountdown(elapsed, timeoutMs);
+        lastCountdownDrawMs = millis();
+      }
+
+      if(elapsed > timeoutMs) {
+        quickAck(false);
+        showResult(false, true);
+        beginRound();
+        return;
+      }
+    }
+
+    // periodic rearm
+    if(millis() - lastSAMRearmMs > 2500) {
+      nfc.SAMConfig();
+      lastSAMRearmMs = millis();
+    }
+
+    // recovery if PN532 stops seeing tags
+    if(millis() - lastRFIDSeenOkMs > RFID_RECOVER_MS) {
+      uiHint("RFID reset...");
+      initPN532WithFallback();
+      lastRFIDSeenOkMs = millis();
+      lastSAMRearmMs = millis();
+      if(phase == PHASE_SCAN) uiHint("Scan the matching RFID peg");
+    }
+
+    delay(1);
+    return;
+  }
+
+// ---------- DONE ----------
+if (state == DONE) {
+  int sx2, sy2;
+  if (touchDebounced(sx2, sy2, nullptr)) {
+    // ✅ tap anywhere => back to level select
+    level = NONE;
+    state = PICK_LEVEL;
+    drawLevelScreen();
+  }
+  delay(20);
+  return;
+}
+
+
+
+  delay(20);
+}
