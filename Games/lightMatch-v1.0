@@ -1,0 +1,921 @@
+/*
+  GAME 3 – COLOR MATCH PAIRS (Rehab)  ✅ FULL FIXED CODE (FAST MODE + COIN BREAKDOWN FIXED)
+
+  ESP32 + ILI9341 (TFT_eSPI) + XPT2046 Touch + PN532 I2C + NeoPixel
+
+  ✅ Levels:
+     - EASY   = 4 pairs  (8 tiles)   | 18s
+     - MEDIUM = 6 pairs  (12 tiles)  | 15s
+     - HARD   = 8 pairs  (16 tiles)  | 13.5s
+  ✅ Board lights with UNIQUE color PAIRS (no color repeats)
+  ✅ Scan 2 DIFFERENT tags:
+     - same color => flash green then both OFF
+     - different color => whole board RED then DONE
+     - same tag twice => IGNORED (yellow blink, no penalty)
+  ✅ Global timer with shrinking bar (cyan->gold->red + blink):
+     - timeout => whole board RED then DONE
+  ✅ DONE screen -> TRY AGAIN -> back to LEVEL menu
+  ✅ PN532 watchdog auto-recover if it stops responding (no new wiring)
+  ✅ UID stability filter (prevents "same color but wrong" glitches)
+
+  ✅ Coins:
+     - coins per CORRECT PAIR
+     - win BONUS (only if all pairs completed)
+     - DONE screen shows breakdown: Pairs / Win / Total earned this round
+
+  HW:
+  - TFT CS = 15
+  - Touch CS = 5, IRQ = 27 (set to 255 if noisy)
+  - PN532 I2C: SDA=32 SCL=33
+  - NeoPixel: pin 25, count 32
+*/
+
+#include <SPI.h>
+#include <Wire.h>
+#include <TFT_eSPI.h>
+#include <XPT2046_Touchscreen.h>
+#include <Adafruit_PN532.h>
+#include <Adafruit_NeoPixel.h>
+
+// ---------------- PINS ----------------
+#define TFT_CS_PIN   15
+
+#define TOUCH_CS     5
+#define TOUCH_IRQ    27   // if IRQ noisy, set to 255
+
+#define PN532_SDA    32
+#define PN532_SCL    33
+
+#define LED_PIN      25
+#define LED_COUNT    32
+
+// ESP32 SPI pins (your wiring)
+#define SPI_SCK_PIN  18
+#define SPI_MISO_PIN 19
+#define SPI_MOSI_PIN 23
+
+// ---------------- OBJECTS ----------------
+TFT_eSPI tft = TFT_eSPI();
+XPT2046_Touchscreen ts(TOUCH_CS, TOUCH_IRQ);
+Adafruit_PN532 nfc(-1, -1); // I2C, no IRQ/RST
+Adafruit_NeoPixel strip(LED_COUNT, LED_PIN, NEO_GRB + NEO_KHZ800);
+
+// ---------------- SCREEN ----------------
+static const int SCREEN_W = 320;
+static const int SCREEN_H = 240;
+static const uint8_t TFT_ROT = 1;
+static const uint8_t TS_ROT  = 1;
+
+// ---------------- TOUCH FILTER ----------------
+static const int Z_MIN = 200;
+static const int Z_MAX = 3800;
+static uint32_t lastTouchMs = 0;
+
+// Touch calibration (yours)
+static int  TOUCH_X_MIN = 350;
+static int  TOUCH_X_MAX = 3800;
+static int  TOUCH_Y_MIN = 300;
+static int  TOUCH_Y_MAX = 3800;
+
+// If level buttons are wrong -> toggle TOUCH_SWAP_XY
+static bool TOUCH_SWAP_XY  = false;
+static bool TOUCH_INVERT_X = true;
+static bool TOUCH_INVERT_Y = false;
+
+// ---------------- UI COLORS (565) ----------------
+const uint16_t C_BG     = 0x08A3;
+const uint16_t C_PANEL2 = 0x18E7;
+const uint16_t C_MUTED  = 0xBDF7;
+const uint16_t C_ACCENT = 0x07FF; // cyan
+const uint16_t C_OK     = 0x07E0; // green
+const uint16_t C_BAD    = 0xF800; // red
+const uint16_t C_WARN   = 0xFD20; // gold
+
+// ---------------- LED ZONES ----------------
+const uint8_t LED_ZONES[] = {0,2,4,6,9,11,13,15,16,18,20,22,25,27,29,31};
+const int NUM_ZONES = sizeof(LED_ZONES) / sizeof(LED_ZONES[0]);
+
+// ---------------- UID MAP ----------------
+struct ZoneMap { uint8_t led; uint8_t uid[4]; };
+ZoneMap MAP[] = {
+  {0,{0x49,0x04,0x16,0xA4}}, {2,{0xC4,0x90,0x86,0xBB}},
+  {4,{0x39,0x94,0xBB,0xA2}}, {6,{0x46,0xC2,0x86,0xBB}},
+  {9,{0x79,0x78,0x21,0xA4}}, {11,{0x49,0xB3,0x25,0xA4}},
+  {13,{0x79,0x69,0xCC,0xA2}}, {15,{0xB9,0xB7,0x84,0xC1}},
+  {16,{0x89,0x74,0x85,0xC2}}, {18,{0x6B,0x8F,0xD5,0xAB}},
+  {20,{0x89,0x59,0x23,0xA4}}, {22,{0x29,0xCF,0x38,0x59}},
+  {25,{0xD9,0x60,0x22,0xA4}}, {27,{0x89,0xE9,0xC3,0xA2}},
+  {29,{0x19,0xF7,0x80,0xC1}}, {31,{0x09,0xC3,0xCA,0xA2}}
+};
+const int MAP_LEN = sizeof(MAP) / sizeof(MAP[0]);
+
+// ---------------- UNIQUE PALETTE (1 color per pair) ----------------
+static const uint32_t PALETTE[] = {
+  0x00FFD400, // Yellow
+  0x00FF4FD8, // Pink
+  0x009B4DFF, // Purple
+  0x00005BFF, // Blue
+  0x00FF7A00, // Orange
+  0x0000D94A, // Green
+  0x00FF1A1A, // Red
+  0x0000E5FF  // CYAN
+};
+static const int PALETTE_LEN = sizeof(PALETTE) / sizeof(PALETTE[0]);
+
+// ---------- UID STABILITY FILTER ----------
+uint8_t stableUid[4];
+uint8_t stableCount = 0;
+uint32_t lastUidMs = 0;
+static const uint32_t UID_STABLE_WINDOW = 120; // ms
+static const uint8_t UID_REQUIRED_HITS = 2;
+
+// ---------------- GAME STATE ----------------
+enum Level { LV_NONE, LV_EASY, LV_MEDIUM, LV_HARD };
+enum State { ST_RFID_RETRY, ST_PICK_LEVEL, ST_COUNTDOWN, ST_SHOW_BOARD, ST_PLAY, ST_DONE };
+enum InputPhase { WAIT_FOR_TAG, WAIT_FOR_LIFT };
+
+Level level = LV_NONE;
+State state = ST_RFID_RETRY;
+InputPhase inputPhase = WAIT_FOR_TAG;
+
+int score = 0;
+int coinsTotal = 0;
+int pairsMatched = 0;
+
+// --------- Level parameters ----------
+int boardPairs = 4;
+uint32_t roundMs = 18000;
+
+// --------- Round timer ----------
+uint32_t roundStartMs = 0;
+
+// --------- Touch/UI layout ----------
+static const int CARD_X = 30;
+static const int CARD_Y = 44;
+static const int CARD_W = 260;
+static const int CARD_H = 42;
+
+static const int BTN_X = 20;
+static const int BTN_W = 280;
+static const int BTN_H = 36;
+static const int BTN_EASY_Y = 96;
+static const int BTN_MED_Y  = 140;
+static const int BTN_HARD_Y = 184;
+
+static const int BTN_RETRY_X = 80;
+static const int BTN_RETRY_Y = 168;
+static const int BTN_RETRY_W = 160;
+static const int BTN_RETRY_H = 46;
+
+static const int BTN_DONE_X = 60;
+static const int BTN_DONE_Y = 192;
+static const int BTN_DONE_W = 200;
+static const int BTN_DONE_H = 44;
+
+// --------- Global time bar ----------
+static const int BAR_X = 40;
+static const int BAR_Y = 30;
+static const int BAR_W = 240;
+static const int BAR_H = 10;
+uint32_t lastBarDrawMs = 0;
+int lastBarFill = -1;
+
+// --------- RFID watchdog ----------
+uint32_t lastRFIDOkMs = 0;
+uint32_t lastRecoverMs = 0;
+static const uint32_t RFID_STUCK_MS = 2500;
+static const uint32_t RECOVER_COOLDOWN_MS = 1200;
+
+// --------- Coins breakdown (per round) ----------
+int coinsRound = 0;        // total earned THIS round
+int coinsFromMatches = 0;  // earned from correct pairs
+int coinsFromBonus = 0;    // earned from win bonus
+
+// ---------------- MATCH BOARD ----------------
+static const int MAX_ACTIVE = 16;
+int activeCount = 0;
+uint8_t activeLed[MAX_ACTIVE];
+bool matched[MAX_ACTIVE];
+uint8_t colorId[MAX_ACTIVE];
+
+// selection
+bool hasFirst = false;
+int firstIdx = -1;
+
+// ---------------- HELPERS ----------------
+static int clampi(int v, int lo, int hi){ if(v<lo) return lo; if(v>hi) return hi; return v; }
+
+void ledsOff() { strip.clear(); strip.show(); }
+
+void fillAll(uint32_t c) {
+  for(int i=0;i<LED_COUNT;i++) strip.setPixelColor(i, c);
+  strip.show();
+}
+
+void flashAll(uint32_t c, int times, int onMs=120, int offMs=80) {
+  for(int t=0;t<times;t++){
+    fillAll(c); delay(onMs);
+    ledsOff();  delay(offMs);
+  }
+}
+
+void blinkLed(uint8_t led, uint32_t c, int times=1, int onMs=110, int offMs=70) {
+  for(int t=0;t<times;t++){
+    strip.setPixelColor(led, c);
+    strip.show();
+    delay(onMs);
+    strip.setPixelColor(led, 0);
+    strip.show();
+    delay(offMs);
+  }
+}
+
+bool ledInUse(uint8_t led, int n) {
+  for(int i=0;i<n;i++) if(activeLed[i]==led) return true;
+  return false;
+}
+
+// ---------------- TOUCH ----------------
+bool readTouchRaw(TS_Point &out) {
+  digitalWrite(TFT_CS_PIN, HIGH);
+  if (TOUCH_IRQ != 255 && digitalRead(TOUCH_IRQ) == HIGH) return false;
+
+  TS_Point best(0,0,0);
+  for(int i=0;i<6;i++){
+    TS_Point p = ts.getPoint();
+    if(p.z > best.z) best = p;
+    delay(2);
+  }
+  if(best.z < Z_MIN || best.z > Z_MAX) return false;
+  out = best;
+  return true;
+}
+
+bool rawToScreen(const TS_Point &raw, int &sx, int &sy) {
+  int rx = raw.x, ry = raw.y;
+  if(TOUCH_SWAP_XY) { int tmp=rx; rx=ry; ry=tmp; }
+
+  rx = clampi(rx, TOUCH_X_MIN, TOUCH_X_MAX);
+  ry = clampi(ry, TOUCH_Y_MIN, TOUCH_Y_MAX);
+
+  long nx = (long)(rx - TOUCH_X_MIN) * (SCREEN_W - 1) / (TOUCH_X_MAX - TOUCH_X_MIN);
+  long ny = (long)(ry - TOUCH_Y_MIN) * (SCREEN_H - 1) / (TOUCH_Y_MAX - TOUCH_Y_MIN);
+
+  if(TOUCH_INVERT_X) nx = (SCREEN_W - 1) - nx;
+  if(TOUCH_INVERT_Y) ny = (SCREEN_H - 1) - ny;
+
+  sx = (int)nx; sy = (int)ny;
+  return true;
+}
+
+bool touchDebounced(int &sx, int &sy) {
+  TS_Point raw;
+  if(!readTouchRaw(raw)) return false;
+  if(millis() - lastTouchMs < 220) return false;
+  lastTouchMs = millis();
+  return rawToScreen(raw, sx, sy);
+}
+
+// ---------------- RFID ----------------
+const uint8_t* expectedUIDForLed(uint8_t led){
+  for(int i=0;i<MAP_LEN;i++) if(MAP[i].led == led) return MAP[i].uid;
+  return nullptr;
+}
+
+bool uidEq(const uint8_t*a,const uint8_t*b){
+  for(int i=0;i<4;i++) if(a[i]!=b[i]) return false;
+  return true;
+}
+
+bool initPN532Once() {
+  nfc.begin();
+  delay(30);
+  uint32_t v = nfc.getFirmwareVersion();
+  if(!v) return false;
+  nfc.SAMConfig();
+  return true;
+}
+
+bool initPN532WithFallback() {
+  Wire.setClock(100000);
+  Wire.setTimeOut(50);
+  return initPN532Once();
+}
+
+void kickPN532() { nfc.SAMConfig(); }
+
+void recoverRFID() {
+  if (millis() - lastRecoverMs < RECOVER_COOLDOWN_MS) return;
+  lastRecoverMs = millis();
+
+  nfc.SAMConfig();
+  delay(10);
+
+  Wire.end();
+  delay(20);
+  Wire.begin(PN532_SDA, PN532_SCL);
+  Wire.setClock(100000);
+  Wire.setTimeOut(50);
+  delay(20);
+
+  initPN532WithFallback();
+  lastRFIDOkMs = millis();
+}
+
+bool readUID4(uint8_t out[4]) {
+  uint8_t uid[7], len;
+  bool ok = nfc.readPassiveTargetID(PN532_MIFARE_ISO14443A, uid, &len, 40);
+  if(!ok || len < 4) {
+    stableCount = 0;
+    return false;
+  }
+
+  uint32_t now = millis();
+
+  if(stableCount == 0 || (now - lastUidMs) > UID_STABLE_WINDOW) {
+    memcpy(stableUid, uid, 4);
+    stableCount = 1;
+    lastUidMs = now;
+    return false;
+  }
+
+  if(memcmp(stableUid, uid, 4) == 0) {
+    stableCount++;
+    lastUidMs = now;
+
+    if(stableCount >= UID_REQUIRED_HITS) {
+      memcpy(out, stableUid, 4);
+      stableCount = 0;
+      lastRFIDOkMs = millis();
+      return true;
+    }
+  } else {
+    memcpy(stableUid, uid, 4);
+    stableCount = 1;
+    lastUidMs = now;
+  }
+  return false;
+}
+
+int findActiveIndexByUID(const uint8_t uid4[4]) {
+  for(int i=0;i<activeCount;i++){
+    const uint8_t* exp = expectedUIDForLed(activeLed[i]);
+    if(exp && uidEq(uid4, exp)) return i;
+  }
+  return -1;
+}
+
+// ---------------- UI helpers ----------------
+uint16_t blend565(uint16_t c1, uint16_t c2, uint8_t t) {
+  uint8_t r1 = (c1 >> 11) & 0x1F, g1 = (c1 >> 5) & 0x3F, b1 = c1 & 0x1F;
+  uint8_t r2 = (c2 >> 11) & 0x1F, g2 = (c2 >> 5) & 0x3F, b2 = c2 & 0x1F;
+  uint8_t r = (r1*(255-t) + r2*t)/255;
+  uint8_t g = (g1*(255-t) + g2*t)/255;
+  uint8_t b = (b1*(255-t) + b2*t)/255;
+  return (r<<11) | (g<<5) | b;
+}
+
+void fillGradV(int x, int y, int w, int h, uint16_t top, uint16_t bot, int step=2) {
+  for(int i=0;i<h;i+=step){
+    uint8_t t = (uint32_t)i * 255 / (h - 1);
+    uint16_t c = blend565(top, bot, t);
+    tft.fillRect(x, y+i, w, step, c);
+  }
+}
+
+void drawBackground() {
+  fillGradV(0,0,SCREEN_W,SCREEN_H, C_BG, 0x0008, 2);
+  for(int i=0;i<18;i++) tft.drawPixel(random(0,SCREEN_W), random(0,SCREEN_H), TFT_WHITE);
+}
+
+void drawTopTitle(const char* title) {
+  tft.setTextDatum(MC_DATUM);
+  tft.setTextFont(2);
+  tft.setTextColor(C_MUTED, TFT_BLACK);
+  tft.drawString(title, 160, 18);
+  tft.setTextDatum(TL_DATUM);
+}
+
+void uiButton(int x,int y,int w,int h,uint16_t bg,const char* label) {
+  tft.fillRoundRect(x+3,y+3,w,h,16,TFT_BLACK);
+  tft.fillRoundRect(x,y,w,h,16,bg);
+  tft.drawRoundRect(x,y,w,h,16,TFT_WHITE);
+
+  tft.setTextDatum(MC_DATUM);
+  tft.setTextFont(4);
+  tft.setTextColor(TFT_BLACK, bg);
+  tft.drawString(label, x+w/2+1, y+h/2+1);
+  tft.setTextColor(TFT_WHITE, bg);
+  tft.drawString(label, x+w/2, y+h/2);
+  tft.setTextDatum(TL_DATUM);
+}
+
+void drawCenterCard(const char* top, const char* bottom) {
+  tft.fillRoundRect(CARD_X+3, CARD_Y+3, CARD_W, CARD_H, 14, TFT_BLACK);
+  tft.fillRoundRect(CARD_X,   CARD_Y,   CARD_W, CARD_H, 14, C_PANEL2);
+  tft.drawRoundRect(CARD_X,   CARD_Y,   CARD_W, CARD_H, 14, TFT_WHITE);
+
+  tft.setTextDatum(MC_DATUM);
+  tft.setTextFont(2);
+  tft.setTextColor(C_ACCENT, C_PANEL2);
+  tft.drawString(top, 160, CARD_Y + 14);
+
+  tft.setTextFont(1);
+  tft.setTextColor(TFT_WHITE, C_PANEL2);
+  tft.drawString(bottom, 160, CARD_Y + 28);
+  tft.setTextDatum(TL_DATUM);
+}
+
+// --------- Time bar ----------
+void drawTimeBarFrame() {
+  tft.drawRoundRect(BAR_X, BAR_Y, BAR_W, BAR_H, 4, TFT_WHITE);
+  tft.fillRoundRect(BAR_X+1, BAR_Y+1, BAR_W-2, BAR_H-2, 3, TFT_BLACK);
+  lastBarFill = -1;
+  lastBarDrawMs = 0;
+}
+
+void updateTimeBar() {
+  if(state != ST_PLAY) return;
+  if(millis() - lastBarDrawMs < 80) return;
+  lastBarDrawMs = millis();
+
+  uint32_t elapsed = millis() - roundStartMs;
+  if(elapsed > roundMs) elapsed = roundMs;
+  uint32_t remaining = roundMs - elapsed;
+
+  int fillPx = (int)((uint32_t)(BAR_W-2) * remaining / roundMs);
+  if(fillPx == lastBarFill) {
+    if(remaining > (roundMs / 10)) return;
+  }
+  lastBarFill = fillPx;
+
+  uint32_t pct = (uint32_t)remaining * 100 / roundMs;
+
+  uint16_t barColor = C_ACCENT;
+  if(pct <= 20) barColor = C_BAD;
+  else if(pct <= 50) barColor = C_WARN;
+
+  bool blink = (pct <= 10);
+  if(blink) {
+    bool on = ((millis() / 180) % 2) == 0;
+    if(!on) barColor = TFT_BLACK;
+  }
+
+  tft.fillRoundRect(BAR_X+1, BAR_Y+1, BAR_W-2, BAR_H-2, 3, TFT_BLACK);
+  if(fillPx > 0 && barColor != TFT_BLACK) {
+    tft.fillRoundRect(BAR_X+1, BAR_Y+1, fillPx, BAR_H-2, 3, barColor);
+  }
+}
+
+// ---------------- SCREENS ----------------
+void drawRfidRetryScreen() {
+  ledsOff();
+  drawBackground();
+  drawTopTitle("Color Match Pairs");
+  drawCenterCard("RFID ERROR", "Tap RETRY to reconnect");
+  uiButton(BTN_RETRY_X, BTN_RETRY_Y, BTN_RETRY_W, BTN_RETRY_H, C_WARN, "RETRY");
+}
+
+void drawLevelScreen() {
+  ledsOff();
+  drawBackground();
+  drawTopTitle("Color Match Pairs");
+  drawCenterCard("Choose Difficulty", "Match all pairs before time ends");
+
+  uiButton(BTN_X, BTN_EASY_Y, BTN_W, BTN_H, C_OK,   "EASY");
+  uiButton(BTN_X, BTN_MED_Y,  BTN_W, BTN_H, C_WARN, "MEDIUM");
+  uiButton(BTN_X, BTN_HARD_Y, BTN_W, BTN_H, C_BAD,  "HARD");
+}
+
+void drawPlayScreenHeader() {
+  drawBackground();
+  drawTopTitle("Match the Colors");
+  drawCenterCard("SCAN 2 TAGS", "Same color = match (same tag ignored)");
+  drawTimeBarFrame();
+
+  tft.setTextDatum(MC_DATUM);
+  tft.setTextFont(2);
+  tft.setTextColor(C_MUTED, TFT_BLACK);
+
+  tft.fillRect(0, 210, 320, 30, TFT_BLACK);
+  tft.drawString(String("Coins: ") + coinsTotal, 60, 224);
+  tft.drawString(String("Pairs: ") + pairsMatched + "/" + boardPairs, 250, 224);
+
+  tft.setTextDatum(TL_DATUM);
+}
+
+void drawDoneScreen(bool win, bool timeout=false) {
+  ledsOff();
+  drawBackground();
+
+  tft.setTextDatum(MC_DATUM);
+  tft.setTextFont(4);
+  if(win) {
+    tft.setTextColor(C_OK, TFT_BLACK);
+    tft.drawString("GREAT!", 160, 40);
+  } else {
+    tft.setTextColor(C_BAD, TFT_BLACK);
+    tft.drawString(timeout ? "TIME!" : "OOPS!", 160, 40);
+  }
+
+  int msgY = 70;
+  tft.fillRoundRect(30, msgY, 260, 44, 14, C_PANEL2);
+  tft.drawRoundRect(30, msgY, 260, 44, 14, TFT_WHITE);
+
+  tft.setTextFont(2);
+  tft.setTextColor(TFT_WHITE, C_PANEL2);
+  if(win) tft.drawString("All pairs matched!", 160, msgY + 22);
+  else if(timeout) tft.drawString("Try faster next time", 160, msgY + 22);
+  else tft.drawString("Wrong pair", 160, msgY + 22);
+
+  // Reward breakdown
+  int bx = 30, by = 122, bw = 260, bh = 44;
+  tft.fillRoundRect(bx, by, bw, bh, 14, TFT_BLACK);
+  tft.drawRoundRect(bx, by, bw, bh, 14, TFT_WHITE);
+
+  tft.setTextDatum(TL_DATUM);
+  tft.setTextFont(2);
+  tft.setTextColor(C_MUTED, TFT_BLACK);
+  tft.drawString("Earned this round", bx + 12, by + 6);
+
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  tft.drawString(String("Pairs +") + coinsFromMatches, bx + 12, by + 24);
+  tft.drawString(String("Win +")   + coinsFromBonus,   bx + 120, by + 24);
+
+  tft.setTextDatum(TR_DATUM);
+  tft.setTextFont(4);
+  tft.setTextColor(C_ACCENT, TFT_BLACK);
+  tft.drawString(String("+") + coinsRound, bx + bw - 12, by + 30);
+
+  // Footer: Score + total coins
+  tft.setTextDatum(MC_DATUM);
+  tft.setTextFont(2);
+  tft.setTextColor(C_MUTED, TFT_BLACK);
+  tft.drawString(String("Score: ") + score + "   Total Coins: " + coinsTotal, 160, 178);
+
+  uiButton(BTN_DONE_X, BTN_DONE_Y, BTN_DONE_W, BTN_DONE_H, C_ACCENT, "TRY AGAIN");
+  tft.setTextDatum(TL_DATUM);
+}
+
+// ---------------- LEVEL SETTINGS ----------------
+void applyLevelSettings() {
+  if(level == LV_EASY) {
+    boardPairs = 4;
+    roundMs = 18000;
+  } else if(level == LV_MEDIUM) {
+    boardPairs = 6;
+    roundMs = 15000;   // ✅ your request
+  } else {
+    boardPairs = 8;
+    roundMs = 13500;   // ✅ your request (13.5s)
+  }
+
+  if(boardPairs > 8) boardPairs = 8;
+  if(boardPairs < 1) boardPairs = 1;
+}
+
+// ---------------- BOARD GENERATION ----------------
+void generateBoard() {
+  activeCount = boardPairs * 2;
+  if(activeCount > MAX_ACTIVE) activeCount = MAX_ACTIVE;
+
+  int n=0;
+  while(n < activeCount) {
+    uint8_t led = LED_ZONES[random(NUM_ZONES)];
+    if(!ledInUse(led, n)) {
+      activeLed[n] = led;
+      matched[n] = false;
+      n++;
+    }
+  }
+
+  int idx = 0;
+  for(int pairId=0; pairId < boardPairs && (idx+1)<activeCount; pairId++){
+    colorId[idx++] = (uint8_t)pairId;
+    colorId[idx++] = (uint8_t)pairId;
+  }
+
+  for(int i=activeCount-1;i>0;i--){
+    int j = random(0, i+1);
+    uint8_t tmp = colorId[i];
+    colorId[i] = colorId[j];
+    colorId[j] = tmp;
+  }
+
+  hasFirst = false;
+  firstIdx = -1;
+  pairsMatched = 0;
+}
+
+void renderBoardLeds() {
+  strip.clear();
+  for(int i=0;i<activeCount;i++){
+    if(matched[i]) continue;
+    uint8_t pid = colorId[i];
+    strip.setPixelColor(activeLed[i], PALETTE[pid]);
+  }
+  strip.show();
+}
+
+void flashMatchedPair(int a, int b) {
+  strip.setPixelColor(activeLed[a], strip.Color(0, 220, 0));
+  strip.setPixelColor(activeLed[b], strip.Color(0, 220, 0));
+  strip.show();
+  delay(180);
+
+  strip.setPixelColor(activeLed[a], PALETTE[colorId[a]]);
+  strip.setPixelColor(activeLed[b], PALETTE[colorId[b]]);
+  strip.show();
+  delay(90);
+}
+
+int pointsPerMatch() {
+  if(level == LV_EASY) return 5;
+  if(level == LV_MEDIUM) return 8;
+  return 12;
+}
+
+// Coins
+int coinsPerMatch() {
+  if(level == LV_EASY) return 1;
+  if(level == LV_MEDIUM) return 2;
+  return 3;
+}
+int coinsWinBonus() {
+  if(level == LV_EASY) return 4;
+  if(level == LV_MEDIUM) return 6;
+  return 8;
+}
+
+// ---------------- FLOW ----------------
+void doCountdown() {
+  drawBackground();
+  drawTopTitle("Get ready");
+  drawCenterCard("STARTING", "Match the color pairs");
+
+  for(int n=3; n>=1; n--){
+    int x=70, y=96, w=180, h=84;
+    tft.fillRoundRect(x+3,y+3,w,h,16,TFT_BLACK);
+    tft.fillRoundRect(x,y,w,h,16,C_PANEL2);
+    tft.drawRoundRect(x,y,w,h,16,TFT_WHITE);
+
+    tft.setTextDatum(MC_DATUM);
+    tft.setTextFont(8);
+    tft.setTextColor(TFT_WHITE, C_PANEL2);
+    tft.drawString(String(n), 160, 138);
+    tft.setTextDatum(TL_DATUM);
+
+    flashAll(strip.Color(0,120,180), 1, 70, 70);
+    delay(650);
+
+    drawBackground();
+    drawTopTitle("Get ready");
+    drawCenterCard("STARTING", "Match the color pairs");
+  }
+  state = ST_SHOW_BOARD;
+}
+
+void showBoard() {
+  generateBoard();
+  drawPlayScreenHeader();
+  renderBoardLeds();
+
+  roundStartMs = millis();
+  inputPhase = WAIT_FOR_TAG;
+  kickPN532();
+  lastRFIDOkMs = millis();
+
+  state = ST_PLAY;
+}
+
+// ---------------- INPUT ----------------
+void handlePlay() {
+  if(millis() - lastRFIDOkMs > RFID_STUCK_MS) recoverRFID();
+
+  if(millis() - roundStartMs > roundMs) {
+    fillAll(strip.Color(180,0,0));
+    delay(450);
+    ledsOff();
+    state = ST_DONE;
+    drawDoneScreen(false, true);
+    return;
+  }
+
+  uint8_t uid4[4];
+  bool tagPresent = readUID4(uid4);
+
+  if(inputPhase == WAIT_FOR_TAG) {
+    if(!tagPresent) return;
+
+    int idx = findActiveIndexByUID(uid4);
+    if(idx < 0) {
+      flashAll(strip.Color(180,0,0), 1, 60, 60);
+      inputPhase = WAIT_FOR_LIFT;
+      return;
+    }
+    if(matched[idx]) {
+      blinkLed(activeLed[idx], strip.Color(255, 200, 40), 1, 90, 60);
+      inputPhase = WAIT_FOR_LIFT;
+      return;
+    }
+
+    if(!hasFirst) {
+      hasFirst = true;
+      firstIdx = idx;
+      blinkLed(activeLed[idx], strip.Color(255,255,255), 1, 90, 60);
+      renderBoardLeds();
+      inputPhase = WAIT_FOR_LIFT;
+      return;
+    }
+
+    if(idx == firstIdx) {
+      blinkLed(activeLed[idx], strip.Color(255, 200, 40), 1, 110, 70);
+      renderBoardLeds();
+      inputPhase = WAIT_FOR_LIFT;
+      return;
+    }
+
+    bool ok = (colorId[idx] == colorId[firstIdx]);
+
+    if(ok) {
+      flashMatchedPair(firstIdx, idx);
+      matched[firstIdx] = true;
+      matched[idx] = true;
+      pairsMatched++;
+      score += pointsPerMatch();
+
+      // ✅ FIX: add coins AND breakdown
+      int c = coinsPerMatch();
+      coinsTotal += c;
+      coinsRound += c;
+      coinsFromMatches += c;
+
+      drawPlayScreenHeader();
+      renderBoardLeds();
+
+      hasFirst = false;
+      firstIdx = -1;
+
+      if(pairsMatched >= boardPairs) {
+        flashAll(strip.Color(0,180,0), 2, 130, 90);
+
+        // ✅ FIX: true WIN BONUS
+        int b = coinsWinBonus();
+        coinsTotal += b;
+        coinsRound += b;
+        coinsFromBonus += b;
+
+        state = ST_DONE;
+        drawDoneScreen(true, false);
+        return;
+      }
+
+    } else {
+      fillAll(strip.Color(180,0,0));
+      delay(450);
+      ledsOff();
+      state = ST_DONE;
+      drawDoneScreen(false, false);
+      return;
+    }
+
+    inputPhase = WAIT_FOR_LIFT;
+    return;
+  }
+
+  if(tagPresent) return;
+  inputPhase = WAIT_FOR_TAG;
+  kickPN532();
+}
+
+// ---------------- SETUP / LOOP ----------------
+void setup() {
+  Serial.begin(115200);
+  delay(150);
+  randomSeed(micros());
+
+  pinMode(TFT_CS_PIN, OUTPUT);
+  digitalWrite(TFT_CS_PIN, HIGH);
+
+  pinMode(TOUCH_CS, OUTPUT);
+  digitalWrite(TOUCH_CS, HIGH);
+
+  if(TOUCH_IRQ != 255) pinMode(TOUCH_IRQ, INPUT);
+
+  SPI.begin(SPI_SCK_PIN, SPI_MISO_PIN, SPI_MOSI_PIN);
+
+  tft.init();
+  tft.setRotation(TFT_ROT);
+  tft.setTextWrap(false);
+
+  ts.begin();
+  ts.setRotation(TS_ROT);
+
+  strip.begin();
+  ledsOff();
+
+  Wire.begin(PN532_SDA, PN532_SCL);
+  Wire.setClock(100000);
+  Wire.setTimeOut(50);
+
+  if(initPN532WithFallback()) {
+    state = ST_PICK_LEVEL;
+    drawLevelScreen();
+    lastRFIDOkMs = millis();
+  } else {
+    state = ST_RFID_RETRY;
+    drawRfidRetryScreen();
+  }
+}
+
+void loop() {
+  int sx, sy;
+
+  if(state == ST_RFID_RETRY) {
+    if(touchDebounced(sx, sy)) {
+      bool inRetry =
+        (sx >= BTN_RETRY_X && sx <= BTN_RETRY_X + BTN_RETRY_W &&
+         sy >= BTN_RETRY_Y && sy <= BTN_RETRY_Y + BTN_RETRY_H);
+
+      if(inRetry) {
+        drawCenterCard("RETRYING...", "Please wait");
+        if(initPN532WithFallback()) {
+          state = ST_PICK_LEVEL;
+          drawLevelScreen();
+          lastRFIDOkMs = millis();
+        } else {
+          drawRfidRetryScreen();
+        }
+      }
+    }
+    delay(20);
+    return;
+  }
+
+  if(state == ST_PICK_LEVEL) {
+    if(touchDebounced(sx, sy)) {
+      bool inEasy =
+        (sx >= BTN_X && sx <= BTN_X + BTN_W &&
+         sy >= BTN_EASY_Y && sy <= BTN_EASY_Y + BTN_H);
+
+      bool inMed  =
+        (sx >= BTN_X && sx <= BTN_X + BTN_W &&
+         sy >= BTN_MED_Y && sy <= BTN_MED_Y + BTN_H);
+
+      bool inHard =
+        (sx >= BTN_X && sx <= BTN_X + BTN_W &&
+         sy >= BTN_HARD_Y && sy <= BTN_HARD_Y + BTN_H);
+
+      if(inEasy)      level = LV_EASY;
+      else if(inMed)  level = LV_MEDIUM;
+      else if(inHard) level = LV_HARD;
+      else { delay(10); return; }
+
+      applyLevelSettings();
+
+      // reset per-session / per-round
+      score = 0;
+      pairsMatched = 0;
+      coinsRound = 0;
+      coinsFromMatches = 0;
+      coinsFromBonus = 0;
+
+      state = ST_COUNTDOWN;
+      doCountdown();
+    }
+    delay(10);
+    return;
+  }
+
+  if(state == ST_COUNTDOWN) { delay(10); return; }
+  if(state == ST_SHOW_BOARD) { showBoard(); delay(10); return; }
+
+  if(state == ST_PLAY) {
+    updateTimeBar();
+    handlePlay();
+    delay(5);
+    return;
+  }
+
+  if(state == ST_DONE) {
+    if(touchDebounced(sx, sy)) {
+      bool inTryAgain =
+        (sx >= BTN_DONE_X && sx <= BTN_DONE_X + BTN_DONE_W &&
+         sy >= BTN_DONE_Y && sy <= BTN_DONE_Y + BTN_DONE_H);
+
+      bool inCenterCard =
+        (sx >= 30 && sx <= 30 + 260 &&
+         sy >= 70 && sy <= 70 + 44);
+
+      if(inTryAgain || inCenterCard) {
+        level = LV_NONE;
+        state = ST_PICK_LEVEL;
+        drawLevelScreen();
+      }
+    }
+    delay(20);
+    return;
+  }
+
+  delay(10);
+}
