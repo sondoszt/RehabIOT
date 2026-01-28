@@ -56,6 +56,8 @@ bool Touch_pressed(int &sx, int &sy);                 // debounced press -> scre
 bool Touch_pressedRaw(int &sx, int &sy, TS_Point &raw);
 
 bool inRect(int x,int y,int rx,int ry,int rw,int rh);
+void reportScore(int coins, int score);
+
 
 // init all hardware once (called from setup in .ino)
 void Shared_setupHardware();
